@@ -1,0 +1,44 @@
+name: Apple Search Ads → BigQuery (multi-org)
+
+on:
+  schedule:
+    - cron: "30 6 * * *"      # daily 06:30 UTC (after stores settle)
+  workflow_dispatch:
+    inputs:
+      full_backfill:
+        description: "Full backfill from BACKFILL_START?"
+        type: boolean
+        default: false
+      backfill_start:
+        description: "Backfill start (YYYY-MM-DD)"
+        required: false
+        default: "2026-01-01"
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: pip install -r requirements.txt
+
+      - name: Run ASA sync
+        env:
+          ASA_CLIENT_ID:        ${{ secrets.ASA_CLIENT_ID }}
+          ASA_TEAM_ID:          ${{ secrets.ASA_TEAM_ID }}
+          ASA_KEY_ID:           ${{ secrets.ASA_KEY_ID }}
+          ASA_PRIVATE_KEY:      ${{ secrets.ASA_PRIVATE_KEY }}
+          ASA_ORG_IDS:          ${{ secrets.ASA_ORG_IDS }}
+          GCP_PROJECT_ID:       ${{ secrets.GCP_PROJECT_ID }}
+          GCP_CREDENTIALS_JSON: ${{ secrets.GCP_CREDENTIALS_JSON }}
+          BQ_DATASET_ID:        ${{ secrets.BQ_DATASET_ID }}
+          BQ_LOCATION:          ${{ secrets.BQ_LOCATION }}
+          FULL_BACKFILL:        ${{ github.event.inputs.full_backfill == 'true' && '1' || '0' }}
+          BACKFILL_START:       ${{ github.event.inputs.backfill_start }}
+        run: python src/asa_sync.py
