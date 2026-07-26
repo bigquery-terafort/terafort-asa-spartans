@@ -1,44 +1,50 @@
 #!/usr/bin/env python3
 """
 ================================================================================
- APPLE SEARCH ADS (Apple Ads) → BIGQUERY  — multi-org, PRODUCTION
+ APPLE SEARCH ADS (Apple Ads) → BIGQUERY  — multi-org, PRODUCTION  **v2**
 ================================================================================
+ v2 mein KYA BADLA (2026-07-26) — teen data-loss guards:
+
+ 🔴 FIX 1 — DELETE-then-empty-INSERT (sabse khatarnak)
+    v1:   DELETE hamesha chalta tha, load `if rows:` ke peeche tha.
+          Agar API khali laut aati (transient, rate-limit ke baad khali page,
+          ya response-shape change) to us org ka POORA MAHINA ur jata aur
+          script phir bhi "✅ loaded (0 rows)" print karke exit 0 deti.
+          Bilkul yehi shakl analytics_app_store_downloads ke saath hui —
+          Jan/Feb/Mar/May/June ke din DELETE ho gaye, INSERT khali tha.
+    v2:   rows khali ho to KUCH NAHI chhua jata. Purana data mehfooz.
+          Aur run ke aakhir mein non-zero exit taake koi dekhe.
+
+ 🔴 FIX 2 — DELETE + LOAD ab ATOMIC (staging + MERGE)
+    v1:   DELETE aur LOAD do alag statements the. Beech mein crash/timeout =
+          data gone.
+    v2:   staging table mein load, phir ek MERGE. Ya poora chalta hai ya kuch
+          nahi. Idempotent bhi hai — dobara chalao, duplicate nahi banega.
+
+ 🔴 FIX 3 — non-USD pe chup nahi rehta
+    v1:   currency != USD  ->  spend_usd = NULL  (unified se spend ghayab,
+          koi error nahi).
+    v2:   foran fail — chup-chaap NULL likhne se behtar hai ke ruk jayen.
+
+ 🟡 FIX 4 — `installs` ka `or` chain 0 ko falsy samajhta tha
+    v1:   g.get("installs") or g.get("totalInstalls") or g.get("tapInstalls")
+          -> agar installs=0 aur totalInstalls=5 ho to 5 le leta tha.
+    v2:   pehla NON-NULL field jo maujood ho, wahi.
+
+ --------------------------------------------------------------------------
  Pulls campaign-level DAILY reporting (spend, impressions, taps, installs,
- new downloads, redownloads, CPA, CPT, by country) for BOTH orgs and lands it
- in one table keyed by (date, org_id, campaign_id, country). The campaign's
- adam_id == App Store app id == apple_id → the join key into app_master_v2 /
- unified_daily_performance (iOS UA-spend source, same role as Facebook/GAds).
-
- AUTH (Apple's private-key JWT flow — unique vs AdMob):
-   1. Build a client-secret JWT (ES256, signed by your private key)
-        header  {alg:ES256, kid:keyId}
-        payload {sub:clientId, iss:teamId, aud:appleid, iat, exp}
-   2. POST to appleid.apple.com/auth/oauth2/token (grant_type=client_credentials,
-      scope=searchadsorg) → short-lived access token (~1h)
-   3. Per org: POST /api/v5/reports/campaigns with header X-AP-Context: orgId=<id>
-
- MULTI-ORG: one set of credentials reaches every org the API user can access.
- The script loops ASA_ORG_IDS and tags each row with org_id + org_name.
-
- IDEMPOTENT: per (org, month) it DELETEs that org's rows in the window then
- reloads — re-runnable, restatement-safe, never duplicates, never touches the
- other org's rows.
-
- Bleed-proof: explicit-fail on bad auth / non-USD-without-handling is flagged
- (spend_native + currency always kept); transient 5xx retried; 4xx never; the
- token is refreshed per run so it can't expire mid-flight.
+ new downloads, redownloads, CPA, CPT, by country) for ALL orgs and lands it
+ in one table keyed by (date, org_id, campaign_id, country). adam_id ==
+ App Store app id == apple_id → join key into app_master_v2.
 
  Required env:
-   ASA_CLIENT_ID, ASA_TEAM_ID, ASA_KEY_ID
-   ASA_PRIVATE_KEY            (the EC private-key PEM, full text)
-   ASA_ORG_IDS               ("8762670,2340270")
+   ASA_CLIENT_ID, ASA_TEAM_ID, ASA_KEY_ID, ASA_PRIVATE_KEY, ASA_ORG_IDS
    GCP_PROJECT_ID, GCP_CREDENTIALS_JSON
  Optional env:
-   BQ_DATASET_ID (default apple_ads)   BQ_TABLE (default asa_campaign_daily)
-   BQ_LOCATION (default US)
-   BACKFILL_START (default 2026-01-01)
-   LOOKBACK_DAYS (default 30)          FULL_BACKFILL ("1")
-   ASA_TIMEZONE (default UTC)          DRY_RUN ("1")
+   BQ_DATASET_ID (apple_ads)  BQ_TABLE (asa_campaign_daily)  BQ_LOCATION (US)
+   BACKFILL_START (2026-01-01)  LOOKBACK_DAYS (30)  FULL_BACKFILL ("1")
+   ASA_TIMEZONE (UTC)  DRY_RUN ("1")
+   ALLOW_NON_USD ("1" -> non-USD ko NULL ke saath guzarne do, default: fail)
 ================================================================================
 """
 import datetime as dt
@@ -55,10 +61,19 @@ TOKEN_URL  = "https://appleid.apple.com/auth/oauth2/token"
 API_BASE   = "https://api.searchads.apple.com/api/v5"
 HTTP_TIMEOUT = 90
 
+# 🆕 v2: run bhar ke masle jama karo — aakhir mein non-zero exit
+RUN_ERRORS: list[str] = []
+
 
 def fail(msg):
     print(f"\n🚨 ASA PIPELINE FAILED: {msg}", file=sys.stderr)
     sys.exit(1)
+
+
+def soft_fail(msg):
+    """Ek window ka masla — poora run mat girao, lekin CHUP mat raho."""
+    print(f"⚠️  {msg}", file=sys.stderr)
+    RUN_ERRORS.append(msg)
 
 
 def env(name, default=None, required=False):
@@ -84,10 +99,11 @@ BACKFILL_START = env("BACKFILL_START", "2026-01-01")
 LOOKBACK_DAYS  = int(env("LOOKBACK_DAYS", "30"))
 FULL_BACKFILL  = env("FULL_BACKFILL", "0") == "1"
 ASA_TIMEZONE   = env("ASA_TIMEZONE", "UTC")
+ALLOW_NON_USD  = env("ALLOW_NON_USD", "0") == "1"   # 🆕 v2
 
 
-# normalize the private key: GitHub secrets sometimes collapse newlines
 def _normalize_pem(pem: str) -> str:
+    """GitHub secrets sometimes collapse newlines."""
     pem = pem.strip()
     if "\\n" in pem and "\n" not in pem:
         pem = pem.replace("\\n", "\n")
@@ -104,7 +120,7 @@ def make_client_secret() -> str:
         "iss": TEAM_ID,
         "aud": "https://appleid.apple.com",
         "iat": now,
-        "exp": now + 3600,  # 1h — minted fresh every run; stays far from Apple's 180d cap
+        "exp": now + 3600,
     }
     try:
         return jwt.encode(payload, _normalize_pem(PRIVATE_KEY),
@@ -148,8 +164,6 @@ def get_access_token(session) -> str:
 
 # --------------------------------------------------------------- org access
 def list_accessible_orgs(session, token) -> dict:
-    """GET /acls → {orgId: orgName} the API user can reach. Used to validate
-    the requested orgs and to fetch human-readable names."""
     r = _api(session, token, None, "GET", "/acls", None, step="acls")
     items = r if isinstance(r, list) else (r.get("data") or [])
     out = {}
@@ -211,9 +225,17 @@ def _num(v):
         return None
 
 
+def _first_present(d: dict, *keys):
+    """🆕 v2: pehla field jo MAUJOOD ho (0 bhi valid value hai).
+    v1 ka `a or b or c` chain 0 ko falsy samajh ke aage barh jata tha."""
+    for k in keys:
+        if k in d and d[k] is not None and d[k] != "":
+            return d[k]
+    return None
+
+
 def fetch_campaign_report(session, token, org_id, start, end):
-    """Campaign-level DAILY report grouped by country for [start, end].
-    Returns the list of report rows (each has metadata + per-day granularity)."""
+    """Campaign-level DAILY report grouped by country for [start, end]."""
     rows, offset, limit = [], 0, 1000
     while True:
         body = {
@@ -256,6 +278,15 @@ def normalize(report_rows, org_id, org_name, pulled_at):
             if not d:
                 continue
             spend = g.get("localSpend", {}) or {}
+            cur = spend.get("currency")
+
+            # 🔴 FIX 3: non-USD pe chup-chaap NULL mat likho
+            if cur and cur != "USD" and not ALLOW_NON_USD:
+                fail(f"org {org_id}: non-USD spend detected ({cur}) but no FX "
+                     f"conversion is wired. Refusing to write NULL spend_usd "
+                     f"(that money would silently vanish from unified). "
+                     f"Either add an FX join, or set ALLOW_NON_USD=1 knowingly.")
+
             out.append({
                 "date": str(d)[:10],
                 "org_id": str(org_id),
@@ -269,24 +300,23 @@ def normalize(report_rows, org_id, org_name, pulled_at):
                 "storefront": meta.get("countryOrRegion"),
                 "impressions": int(_num(g.get("impressions")) or 0),
                 "taps": int(_num(g.get("taps")) or 0),
-                "installs": int(_num(g.get("installs")
-                                     or g.get("totalInstalls")
-                                     or g.get("tapInstalls")) or 0),
-                "new_downloads": int(_num(g.get("newDownloads")
-                                          or g.get("totalNewDownloads")) or 0),
-                "redownloads": int(_num(g.get("redownloads")
-                                        or g.get("totalRedownloads")) or 0),
+                # 🟡 FIX 4: 0 ab sahi tarah handle hota hai
+                "installs": int(_num(_first_present(
+                    g, "installs", "totalInstalls", "tapInstalls")) or 0),
+                "new_downloads": int(_num(_first_present(
+                    g, "newDownloads", "totalNewDownloads")) or 0),
+                "redownloads": int(_num(_first_present(
+                    g, "redownloads", "totalRedownloads")) or 0),
                 "ttr": _num(g.get("ttr")),
-                "conversion_rate": _num(g.get("conversionRate")
-                                        or g.get("tapInstallRate")),
-                "avg_cpa_native": _num(((g.get("avgCPA") or g.get("totalAvgCPA")
-                                         or g.get("tapInstallCPI") or {}) ).get("amount")),
+                "conversion_rate": _num(_first_present(
+                    g, "conversionRate", "tapInstallRate")),
+                "avg_cpa_native": _num((_first_present(
+                    g, "avgCPA", "totalAvgCPA", "tapInstallCPI") or {}).get("amount")),
                 "avg_cpt_native": _num((g.get("avgCPT") or {}).get("amount")),
                 "avg_cpm_native": _num((g.get("avgCPM") or {}).get("amount")),
                 "spend_native": _num(spend.get("amount")),
-                "spend_currency": spend.get("currency"),
-                "spend_usd": (_num(spend.get("amount"))
-                              if (spend.get("currency") == "USD") else None),
+                "spend_currency": cur,
+                "spend_usd": (_num(spend.get("amount")) if cur == "USD" else None),
                 "pulled_at_utc": pulled_at,
             })
     return out
@@ -306,8 +336,33 @@ SCHEMA_DDL = """
   pulled_at_utc TIMESTAMP
 """
 
+MERGE_SET = """
+    campaign_name=S.campaign_name, adam_id=S.adam_id, app_name=S.app_name,
+    campaign_status=S.campaign_status, storefront=S.storefront,
+    org_name=S.org_name,
+    impressions=S.impressions, taps=S.taps, installs=S.installs,
+    new_downloads=S.new_downloads, redownloads=S.redownloads,
+    ttr=S.ttr, conversion_rate=S.conversion_rate,
+    avg_cpa_native=S.avg_cpa_native, avg_cpt_native=S.avg_cpt_native,
+    avg_cpm_native=S.avg_cpm_native,
+    spend_native=S.spend_native, spend_currency=S.spend_currency,
+    spend_usd=S.spend_usd, pulled_at_utc=S.pulled_at_utc
+"""
+
 
 def load_bq(rows, org_id, win_start, win_end):
+    # ══════════════════════════════════════════════════════════════════════
+    # 🔴 FIX 1 — KHALI NATEEJE PE KUCH MAT CHHUO
+    #   v1 mein DELETE hamesha chalta tha aur load `if rows:` ke peeche tha.
+    #   Ek khali API jawab = us org ka poora mahina ghayab, aur script phir
+    #   bhi exit 0. Yehi aafat apple downloads ke saath hui.
+    # ══════════════════════════════════════════════════════════════════════
+    if not rows:
+        soft_fail(f"org {org_id} {win_start}..{win_end}: API returned 0 rows — "
+                  f"SKIPPING the write entirely (existing data left intact). "
+                  f"Next run will retry. Investigate if this repeats.")
+        return
+
     local = f"/tmp/asa_{org_id}_{win_start}.ndjson"
     with open(local, "w") as f:
         for r in rows:
@@ -327,32 +382,48 @@ def load_bq(rows, org_id, win_start, win_end):
     bq.create_dataset(ds, exists_ok=True)
 
     tgt = f"{BQ_PROJECT}.{BQ_DATASET}.{BQ_TABLE}"
+    stg = f"{BQ_PROJECT}.{BQ_DATASET}.{BQ_TABLE}_stg"
+
     bq.query(f"""CREATE TABLE IF NOT EXISTS `{tgt}` ({SCHEMA_DDL})
                  PARTITION BY date CLUSTER BY org_id, adam_id, campaign_id""").result()
 
-    # idempotent: clear this org's window, then append
-    bq.query(f"""DELETE FROM `{tgt}`
-                 WHERE org_id=@o AND date BETWEEN @s AND @e""",
-             job_config=bigquery.QueryJobConfig(query_parameters=[
-                 bigquery.ScalarQueryParameter("o", "STRING", str(org_id)),
-                 bigquery.ScalarQueryParameter("s", "DATE", win_start),
-                 bigquery.ScalarQueryParameter("e", "DATE", win_end),
-             ])).result()
+    # ══════════════════════════════════════════════════════════════════════
+    # 🔴 FIX 2 — ATOMIC: staging mein load, phir ek MERGE.
+    #   v1 mein DELETE aur LOAD do alag statements the — beech mein crash
+    #   hua to data gaya. Ab ya poora chalta hai ya kuch nahi.
+    # ══════════════════════════════════════════════════════════════════════
+    job_cfg = bigquery.LoadJobConfig(
+        source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
+        schema=bq.get_table(tgt).schema,
+        write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE)
+    with open(local, "rb") as f:
+        bq.load_table_from_file(f, stg, job_config=job_cfg).result()
 
-    if rows:
-        job_cfg = bigquery.LoadJobConfig(
-            source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
-            schema=bq.get_table(tgt).schema,
-            write_disposition=bigquery.WriteDisposition.WRITE_APPEND)
-        with open(local, "rb") as f:
-            bq.load_table_from_file(f, tgt, job_config=job_cfg).result()
-    print(f"   ✅ loaded org {org_id} {win_start}..{win_end} ({len(rows)} rows)")
+    merge = bq.query(f"""
+      MERGE `{tgt}` T
+      USING (
+        SELECT * FROM `{stg}`
+        -- staging ke andar hi dedup: ek row per (date, org, campaign, country)
+        QUALIFY ROW_NUMBER() OVER (
+          PARTITION BY date, org_id, IFNULL(campaign_id,''),
+                       IFNULL(country_or_region,'')
+          ORDER BY pulled_at_utc DESC
+        ) = 1
+      ) S
+      ON  T.date    = S.date
+      AND T.org_id  = S.org_id
+      AND IFNULL(T.campaign_id,'')       = IFNULL(S.campaign_id,'')
+      AND IFNULL(T.country_or_region,'') = IFNULL(S.country_or_region,'')
+      WHEN MATCHED THEN UPDATE SET {MERGE_SET}
+      WHEN NOT MATCHED THEN INSERT ROW
+    """)
+    merge.result()
+    print(f"   ✅ merged org {org_id} {win_start}..{win_end} "
+          f"({len(rows)} rows staged, {merge.num_dml_affected_rows} affected)")
 
 
 # --------------------------------------------------------------- windows
 def month_windows(start_d, end_d):
-    """Yield (win_start, win_end) month chunks — keeps each report request small
-    and within Apple's daily-granularity range limits."""
     cur = start_d
     while cur <= end_d:
         last = dt.date(cur.year, cur.month,
@@ -362,7 +433,7 @@ def month_windows(start_d, end_d):
 
 
 # --------------------------------------------------------------- main
-def main():
+def main() -> int:
     pulled_at = dt.datetime.now(dt.timezone.utc).isoformat()
     today = dt.datetime.now(dt.timezone.utc).date()
     if FULL_BACKFILL:
@@ -371,7 +442,7 @@ def main():
         start_d = today - dt.timedelta(days=LOOKBACK_DAYS - 1)
     end_d = today
 
-    print(f"🎯 ASA → BigQuery | orgs={ORG_IDS} | {start_d} → {end_d} "
+    print(f"🎯 ASA → BigQuery v2 | orgs={ORG_IDS} | {start_d} → {end_d} "
           f"| {'FULL BACKFILL' if FULL_BACKFILL else 'rolling'} | tz={ASA_TIMEZONE}")
 
     session = requests.Session()
@@ -380,7 +451,7 @@ def main():
     accessible = list_accessible_orgs(session, token)
     if accessible:
         print(f"✅ API user can access orgs: "
-              f"{', '.join(f'{k}({v})' for k,v in accessible.items())}")
+              f"{', '.join(f'{k}({v})' for k, v in accessible.items())}")
     for oid in ORG_IDS:
         if accessible and oid not in accessible:
             fail(f"org {oid} not accessible by this API user. "
@@ -391,18 +462,27 @@ def main():
         oname = accessible.get(oid, oid)
         print(f"\n=== ORG {oid} ({oname}) ===")
         for w_start, w_end in month_windows(start_d, end_d):
-            # fresh token if a long backfill outruns the 1h token lifetime
-            token = get_access_token(session)
+            token = get_access_token(session)   # long backfill vs 1h token
             report = fetch_campaign_report(session, token, oid,
                                            w_start.isoformat(), w_end.isoformat())
             norm = normalize(report, oid, oname, pulled_at)
-            print(f"   [{w_start}..{w_end}] {len(report)} report rows -> {len(norm)} daily rows")
+            print(f"   [{w_start}..{w_end}] {len(report)} report rows "
+                  f"-> {len(norm)} daily rows")
             load_bq(norm, oid, w_start, w_end)
             grand_total += len(norm)
             time.sleep(1)
 
     print(f"\n🎯 DONE. {grand_total} daily rows across {len(ORG_IDS)} org(s).")
 
+    # 🆕 v2: khali windows chup-chaap na guzren — non-zero exit
+    if RUN_ERRORS:
+        print(f"\n🚨 {len(RUN_ERRORS)} window(s) skipped — data NOT written:",
+              file=sys.stderr)
+        for e in RUN_ERRORS:
+            print(f"   - {e}", file=sys.stderr)
+        return 1
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
