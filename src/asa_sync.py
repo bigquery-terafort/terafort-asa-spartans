@@ -31,6 +31,14 @@
           -> agar installs=0 aur totalInstalls=5 ho to 5 le leta tha.
     v2:   pehla NON-NULL field jo maujood ho, wahi.
 
+ v2.1 (2026-10-07) — "KABHI BEWAJAH FAIL NAHI":
+   🟢 0 rows (ads band / pause / budget khatam) → run GREEN + peela warning,
+      Apple se campaign status pooch kar WAJAH bhi likhta hai.
+   🟢 Apple ka temporary masla (network / 5xx / 429) retries ke baad bhi →
+      window skip, run GREEN, agli run khud dobara le gi. Kuch nahi likha.
+   🟢 BigQuery temporary masla (5xx / 429) → 3 dafa retry (MERGE idempotent).
+   🔴 RED sirf asli toot par: credentials reject, Apple 4xx, rows aayi lekin
+      parse na hui (format badla), non-USD, BigQuery permanent error.
  --------------------------------------------------------------------------
  Pulls campaign-level DAILY reporting (spend, impressions, taps, installs,
  new downloads, redownloads, CPA, CPT, by country) for ALL orgs and lands it
@@ -61,8 +69,15 @@ TOKEN_URL  = "https://appleid.apple.com/auth/oauth2/token"
 API_BASE   = "https://api.searchads.apple.com/api/v5"
 HTTP_TIMEOUT = 90
 
-# 🆕 v2: run bhar ke masle jama karo — aakhir mein non-zero exit
+# 🔴 asli toot — run RED (insaan ko kuch karna hai)
 RUN_ERRORS: list[str] = []
+# 🟡 normal / temporary halaat — run GREEN, lekin annotation + summary mein dikhe
+RUN_WARNINGS: list[str] = []
+
+
+class TransientAPIError(Exception):
+    """Apple ka temporary masla (network / 5xx / 429 / non-JSON) retries ke
+    baad bhi. Kuch nahi likha jata; agli run khud dobara koshish karti hai."""
 
 
 def fail(msg):
@@ -71,9 +86,35 @@ def fail(msg):
 
 
 def soft_fail(msg):
-    """Ek window ka masla — poora run mat girao, lekin CHUP mat raho."""
-    print(f"⚠️  {msg}", file=sys.stderr)
+    """🔴 Ek window ka ASLI masla — baqi windows chalti rahen, run aakhir mein RED."""
+    print(f"::error::{msg}")
     RUN_ERRORS.append(msg)
+
+
+def warn(msg):
+    """🟡 Normal / temporary halaat — run GREEN, peela annotation + summary."""
+    print(f"::warning::{msg}")
+    RUN_WARNINGS.append(msg)
+
+
+def write_summary(rows_written):
+    path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if not path:
+        return
+    def _mask(t):                      # public repo: org id kabhi summary mein nahi
+        for o in ORG_IDS:
+            t = t.replace(o, "***")
+        return t
+    try:
+        with open(path, "a") as f:
+            f.write("## 🍏 ASA sync\n")
+            f.write(f"- rows likhi: **{rows_written}**\n")
+            for w in RUN_WARNINGS:
+                f.write(f"- 🟡 {_mask(w)}\n")
+            for e in RUN_ERRORS:
+                f.write(f"- 🔴 {_mask(e)}\n")
+    except OSError:
+        pass
 
 
 def env(name, default=None, required=False):
@@ -96,7 +137,7 @@ BQ_DATASET  = env("BQ_DATASET_ID", "apple_ads")
 BQ_TABLE    = env("BQ_TABLE", "asa_campaign_daily")
 BQ_LOCATION = env("BQ_LOCATION", "US")
 BACKFILL_START = env("BACKFILL_START", "2026-01-01")
-LOOKBACK_DAYS  = int(env("LOOKBACK_DAYS", "30"))
+LOOKBACK_DAYS  = int(env("LOOKBACK_DAYS", "30") or "30")   # khali secret/output par crash nahi
 FULL_BACKFILL  = env("FULL_BACKFILL", "0") == "1"
 ASA_TIMEZONE   = env("ASA_TIMEZONE", "UTC")
 ALLOW_NON_USD  = env("ALLOW_NON_USD", "0") == "1"   # 🆕 v2
@@ -139,27 +180,32 @@ def get_access_token(session) -> str:
     }
     headers = {"Content-Type": "application/x-www-form-urlencoded",
                "Host": "appleid.apple.com"}
-    delay = 5
-    for i in range(1, 5):
+    delay, last, tries = 5, "", 5
+    for i in range(1, tries + 1):
         try:
             r = session.post(TOKEN_URL, data=data, headers=headers, timeout=HTTP_TIMEOUT)
         except requests.RequestException as exc:
-            if i == 4:
-                fail(f"token endpoint network error: {exc}")
-            time.sleep(delay); delay *= 2; continue
-        if r.status_code >= 500:
-            if i == 4:
-                fail(f"token endpoint HTTP {r.status_code}: {r.text[:200]}")
-            time.sleep(delay); delay *= 2; continue
-        if r.status_code >= 400:
-            fail(f"token request rejected HTTP {r.status_code}: {r.text[:300]} "
-                 f"-> check clientId/teamId/keyId + that the public key is uploaded.")
-        tok = r.json().get("access_token")
-        if not tok:
-            fail(f"token response had no access_token: {r.text[:200]}")
-        print("✅ access token acquired")
-        return tok
-    fail("token: exhausted retries")
+            last = f"network error ({type(exc).__name__})"
+        else:
+            if r.status_code >= 500 or r.status_code == 429:
+                last = f"HTTP {r.status_code}"
+            elif r.status_code >= 400:
+                # 🔴 ASLI TOOT: Apple ne credentials hi reject kar diye
+                fail(f"token request rejected HTTP {r.status_code}: {r.text[:300]} "
+                     f"-> check clientId/teamId/keyId + that the public key is uploaded.")
+            else:
+                try:
+                    tok = (r.json() or {}).get("access_token")
+                except ValueError:
+                    tok, last = None, "non-JSON token response"
+                if tok:
+                    print("✅ access token acquired")
+                    return tok
+                last = last or "token response had no access_token"
+        if i < tries:
+            print(f"⚠️  token attempt {i}: {last}; retry {delay}s")
+            time.sleep(delay); delay = min(delay * 2, 60)
+    raise TransientAPIError(f"token endpoint: {last} ({tries} koshishen)")
 
 
 # --------------------------------------------------------------- org access
@@ -175,44 +221,42 @@ def list_accessible_orgs(session, token) -> dict:
 
 
 # --------------------------------------------------------------- api helper
-def _api(session, token, org_id, method, path, body, step, retries=4):
+def _api(session, token, org_id, method, path, body, step, retries=5):
     headers = {"Authorization": f"Bearer {token}",
                "Content-Type": "application/json",
                "Accept": "application/json"}
     if org_id is not None:
         headers["X-AP-Context"] = f"orgId={org_id}"
     url = API_BASE + path
-    delay = 5
+    delay, last = 5, ""
     for i in range(1, retries + 1):
         try:
             r = session.request(method, url, headers=headers,
                                 json=body, timeout=HTTP_TIMEOUT)
         except requests.RequestException as exc:
-            if i == retries:
-                fail(f"[{step}] network error after {retries}: {exc}")
-            print(f"⚠️  [{step}] attempt {i} network error; retry {delay}s")
-            time.sleep(delay); delay *= 2; continue
-        if r.status_code >= 500:
-            if i == retries:
-                fail(f"[{step}] HTTP {r.status_code} after {retries}: {r.text[:200]}")
-            print(f"⚠️  [{step}] attempt {i} HTTP {r.status_code}; retry {delay}s")
-            time.sleep(delay); delay *= 2; continue
-        if r.status_code == 429:
-            if i == retries:
-                fail(f"[{step}] rate-limited (429) after {retries}")
-            print(f"⚠️  [{step}] 429 rate limit; backing off {delay}s")
-            time.sleep(delay); delay *= 2; continue
-        if r.status_code >= 400:
-            fail(f"[{step}] HTTP {r.status_code}: {r.text[:400]}")
-        try:
-            j = r.json()
-        except ValueError:
-            fail(f"[{step}] non-JSON response: {r.text[:200]}")
-        err = j.get("error")
-        if err and err.get("errors"):
-            fail(f"[{step}] API error: {json.dumps(err)[:300]}")
-        return j.get("data", j)
-    fail(f"[{step}] exhausted retries")
+            last = f"network error ({type(exc).__name__})"
+        else:
+            if r.status_code >= 500 or r.status_code == 429:
+                last = f"HTTP {r.status_code}"
+            elif r.status_code >= 400:
+                # 🔴 ASLI TOOT: request hi ghalat / access chheen liya
+                fail(f"[{step}] HTTP {r.status_code}: {r.text[:400]}")
+            else:
+                try:
+                    j = r.json()
+                except ValueError:
+                    last = "non-JSON response"
+                else:
+                    if not isinstance(j, dict):
+                        return j
+                    err = j.get("error")
+                    if err and err.get("errors"):
+                        fail(f"[{step}] API error: {json.dumps(err)[:300]}")
+                    return j.get("data", j)
+        if i < retries:
+            print(f"⚠️  [{step}] attempt {i}: {last}; retry {delay}s")
+            time.sleep(delay); delay = min(delay * 2, 60)
+    raise TransientAPIError(f"[{step}] {last} ({retries} koshishen)")
 
 
 # --------------------------------------------------------------- reporting
@@ -358,9 +402,7 @@ def load_bq(rows, org_id, win_start, win_end):
     #   bhi exit 0. Yehi aafat apple downloads ke saath hui.
     # ══════════════════════════════════════════════════════════════════════
     if not rows:
-        soft_fail(f"org {org_id} {win_start}..{win_end}: API returned 0 rows — "
-                  f"SKIPPING the write entirely (existing data left intact). "
-                  f"Next run will retry. Investigate if this repeats.")
+        warn(f"{win_start}..{win_end}: 0 rows — write SKIP (purana data safe).")
         return
 
     local = f"/tmp/asa_{org_id}_{win_start}.ndjson"
@@ -422,6 +464,66 @@ def load_bq(rows, org_id, win_start, win_end):
           f"({len(rows)} rows staged, {merge.num_dml_affected_rows} affected)")
 
 
+# --------------------------------------------------------------- 🆕 v2.1 diagnose
+def diagnose_empty_window(session, token, org_id):
+    """0 rows aaye to Apple se poochho: koi campaign chal bhi rahi hai?
+    Kabhi fail() / raise nahi karta. PUBLIC REPO: sirf counts + reasons,
+    campaign naam/id NAHI. Returns (running, total, reasons) ya None."""
+    headers = {"Authorization": f"Bearer {token}",
+               "X-AP-Context": f"orgId={org_id}",
+               "Accept": "application/json"}
+    camps, offset = [], 0
+    try:
+        while True:
+            r = session.get(f"{API_BASE}/campaigns",
+                            params={"limit": 1000, "offset": offset},
+                            headers=headers, timeout=HTTP_TIMEOUT)
+            if r.status_code != 200:
+                print(f"   ⚠️  diagnose: /campaigns HTTP {r.status_code}")
+                return None
+            page = (r.json() or {}).get("data") or []
+            camps.extend(page)
+            if len(page) < 1000:
+                break
+            offset += 1000
+    except Exception as exc:
+        print(f"   ⚠️  diagnose failed: {type(exc).__name__}")
+        return None
+    live = [c for c in camps if isinstance(c, dict) and not c.get("deleted")]
+    running = [c for c in live if c.get("servingStatus") == "RUNNING"]
+    reasons = {}
+    for c in live:
+        if c.get("servingStatus") == "RUNNING":
+            continue
+        for why in (c.get("servingStateReasons") or ["NO_REASON_GIVEN"]):
+            reasons[why] = reasons.get(why, 0) + 1
+    print(f"   🩺 campaigns: {len(live)} total · {len(running)} RUNNING")
+    for why, n in sorted(reasons.items(), key=lambda kv: -kv[1]):
+        print(f"      - {why}: {n}")
+    return len(running), len(live), reasons
+
+
+def load_bq_with_retry(rows, org_id, win_start, win_end, attempts=3):
+    """BigQuery ke TEMPORARY masle (5xx / 429) par dobara. Safe hai kyunke
+    staging WRITE_TRUNCATE + MERGE dono idempotent hain. Permanent error
+    (permission, schema) seedha upar jata hai -> run RED."""
+    if DRY_RUN:
+        return load_bq(rows, org_id, win_start, win_end)
+    from google.api_core import exceptions as gexc
+    retryable = (gexc.ServiceUnavailable, gexc.InternalServerError,
+                 gexc.BadGateway, gexc.GatewayTimeout, gexc.TooManyRequests)
+    delay = 15
+    for i in range(1, attempts + 1):
+        try:
+            return load_bq(rows, org_id, win_start, win_end)
+        except retryable as exc:
+            if i == attempts:
+                raise
+            print(f"⚠️  BigQuery temporary error ({type(exc).__name__}), "
+                  f"attempt {i}; retry {delay}s")
+            time.sleep(delay); delay *= 2
+
+
 # --------------------------------------------------------------- windows
 def month_windows(start_d, end_d):
     cur = start_d
@@ -446,9 +548,14 @@ def main() -> int:
           f"| {'FULL BACKFILL' if FULL_BACKFILL else 'rolling'} | tz={ASA_TIMEZONE}")
 
     session = requests.Session()
-    token = get_access_token(session)
-
-    accessible = list_accessible_orgs(session, token)
+    try:
+        token = get_access_token(session)
+        accessible = list_accessible_orgs(session, token)
+    except TransientAPIError as exc:
+        warn(f"Apple API abhi temporary dastyab nahi ({exc}). Kuch nahi likha, "
+             f"purana data safe; agli run khud dobara koshish karegi.")
+        write_summary(0)
+        return 0
     if accessible:
         print(f"✅ API user can access orgs: "
               f"{', '.join(f'{k}({v})' for k, v in accessible.items())}")
@@ -462,21 +569,58 @@ def main() -> int:
         oname = accessible.get(oid, oid)
         print(f"\n=== ORG {oid} ({oname}) ===")
         for w_start, w_end in month_windows(start_d, end_d):
-            token = get_access_token(session)   # long backfill vs 1h token
-            report = fetch_campaign_report(session, token, oid,
-                                           w_start.isoformat(), w_end.isoformat())
+            tag = f"{oname} {w_start}..{w_end}"
+            try:
+                token = get_access_token(session)   # long backfill vs 1h token
+                report = fetch_campaign_report(session, token, oid,
+                                               w_start.isoformat(), w_end.isoformat())
+            except TransientAPIError as exc:
+                warn(f"{tag}: Apple ka temporary masla ({exc}) — window skip, "
+                     f"purana data safe, agli run dobara le gi.")
+                continue
             norm = normalize(report, oid, oname, pulled_at)
             print(f"   [{w_start}..{w_end}] {len(report)} report rows "
                   f"-> {len(norm)} daily rows")
-            load_bq(norm, oid, w_start, w_end)
+
+            if not report:
+                # 🟢 0 rows = us window mein KISI campaign ki koi delivery nahi
+                #    (ads band / pause / budget khatam). Ye pipeline ka masla
+                #    NAHI — kuch mat likho, run GREEN, wajah annotation mein.
+                diag = diagnose_empty_window(session, token, oid)
+                if diag is None:
+                    why = "campaign status nahi mil saka"
+                elif diag[0] == 0:
+                    rs = ", ".join(f"{k} x{v}" for k, v in diag[2].items())
+                    why = (f"koi campaign RUNNING nahi ({rs})" if diag[1]
+                           else "org mein koi campaign hi nahi")
+                else:
+                    why = (f"{diag[0]} campaign RUNNING phir bhi 0 delivery — "
+                           f"Apple Ads mein bids/budget check karo")
+                warn(f"{tag}: 0 rows — {why}. Kuch nahi likha, purana data safe.")
+                time.sleep(1)
+                continue
+
+            if not norm:
+                # 🔴 rows AAYI lekin ek bhi din parse nahi hua = Apple ka
+                #    response format badla. Chup-chaap khali likhna = data loss.
+                soft_fail(f"{tag}: {len(report)} rows aayi lekin 0 parse hui — "
+                          f"Apple response format badla? Kuch nahi likha.")
+                continue
+
+            load_bq_with_retry(norm, oid, w_start, w_end)
             grand_total += len(norm)
             time.sleep(1)
 
     print(f"\n🎯 DONE. {grand_total} daily rows across {len(ORG_IDS)} org(s).")
+    write_summary(grand_total)
 
-    # 🆕 v2: khali windows chup-chaap na guzren — non-zero exit
+    if RUN_WARNINGS:
+        print(f"🟡 {len(RUN_WARNINGS)} warning(s) — run GREEN (normal halaat):")
+        for w in RUN_WARNINGS:
+            print(f"   - {w}")
+    # 🔴 sirf ASLI toot par non-zero exit
     if RUN_ERRORS:
-        print(f"\n🚨 {len(RUN_ERRORS)} window(s) skipped — data NOT written:",
+        print(f"\n🚨 {len(RUN_ERRORS)} asli masla — data NOT written:",
               file=sys.stderr)
         for e in RUN_ERRORS:
             print(f"   - {e}", file=sys.stderr)
