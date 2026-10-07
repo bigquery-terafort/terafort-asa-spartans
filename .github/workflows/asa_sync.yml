@@ -27,7 +27,9 @@ concurrency:
 
 jobs:
   sync:
-    runs-on: ubuntu-latest
+    # 📌 PINNED: ubuntu-latest 19 Oct 2026 se Ubuntu 26 par shift ho raha hai —
+    #    naye image par Python/gcloud ka surprise na ho, is liye 24.04 fixed.
+    runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
@@ -37,7 +39,13 @@ jobs:
           python-version: "3.11"
 
       - name: Install deps
-        run: pip install -r requirements.txt
+        # 🔁 PyPI ka temporary masla run ko laal na kare — 3 koshishen
+        run: |
+          for i in 1 2 3; do
+            pip install -r requirements.txt && exit 0
+            echo "⚠️ pip install fail (koshish $i/3) — 20s baad dobara"; sleep 20
+          done
+          echo "::error::pip install 3 dafa fail — PyPI down ya requirements toot gaye"; exit 1
 
       # ══════════════════════════════════════════════════════════════════════
       # 🔧 bq CLI — self-heal/verify ke liye. WAHI secret jo loader use karta hai.
@@ -119,6 +127,8 @@ jobs:
           GCP_CREDENTIALS_JSON: ${{ secrets.GCP_CREDENTIALS_JSON }}
           BQ_DATASET_ID:        ${{ secrets.BQ_DATASET_ID }}
           BQ_LOCATION:          ${{ secrets.BQ_LOCATION }}
+          # 🩺 self-heal lookback ab sach mein script tak jata hai (pehle wire nahi tha)
+          LOOKBACK_DAYS:        ${{ steps.before.outputs.lookback || '45' }}
           FULL_BACKFILL:        ${{ github.event.inputs.full_backfill == 'true' && '1' || '0' }}
           BACKFILL_START:       ${{ github.event.inputs.backfill_start }}
         run: python src/asa_sync.py
